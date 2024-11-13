@@ -3,111 +3,124 @@ import streamlit as st
 import altair as alt
 from datetime import timedelta
 
-# Carregar os dados
-data_path = 'data/GDO_2024_2.csv'
-data = pd.read_csv(data_path)
-data['data_fato'] = pd.to_datetime(data['data_fato'])
+# Sidebar para upload de arquivo
+st.sidebar.header("Upload de Arquivo")
+uploaded_file = st.sidebar.file_uploader("Escolha o arquivo CSV", type="csv")
 
-# Definir o período dos últimos 84 dias a partir da data mais recente no dataset
-end_date = data['data_fato'].max()
-start_date = end_date - timedelta(days=83)
+# Continuação do processamento se um arquivo for carregado
+if uploaded_file:
+    # Carregar os dados com parsing adequado e ajustes nas colunas
+    data = pd.read_csv(uploaded_file, delimiter=';', on_bad_lines='skip')
+    data['DATA_FATO'] = pd.to_datetime(data['DATA_FATO'], format='%d/%m/%Y', errors='coerce')
+    
+    # Filtrar linhas com datas válidas
+    data = data.dropna(subset=['DATA_FATO'])
 
-# Filtrar dados para o período de 84 dias
-data_84_days = data[(data['data_fato'] >= start_date) & (data['data_fato'] <= end_date)]
+    # Definir o intervalo de data para os últimos 84 dias
+    end_date = data['DATA_FATO'].max()
+    start_date = end_date - timedelta(days=83)
+    
+    # Filtrar dados dos últimos 84 dias
+    data_84_days = data[(data['DATA_FATO'] >= start_date) & (data['DATA_FATO'] <= end_date)]
 
-# Sidebar para filtros
-st.sidebar.header("Filtros")
-companhias = data['cia_pm'].unique()
-companhia_selecionada = st.sidebar.selectbox("Selecionar Companhia", options=["Todas"] + list(companhias))
+    # Preencher dias faltantes com ICCP_TOTAL = 0 nos últimos 84 dias
+    date_range = pd.date_range(start=start_date, end=end_date)
+    data_84_days = data_84_days.drop_duplicates(subset=['DATA_FATO'])
+    data_84_days_complete = data_84_days.set_index('DATA_FATO').reindex(date_range, fill_value=0).rename_axis('DATA_FATO').reset_index()
+    
+    # Ordenar os valores para calcular a mediana
+    sorted_values = data_84_days_complete['ICCP_TOTAL'].sort_values().reset_index(drop=True)
 
-# Filtrar por companhia, se necessário
-if companhia_selecionada != "Todas":
-    data_filtrada = data_84_days[data_84_days['cia_pm'] == companhia_selecionada]
+    # Calcular o limite inferior (7º valor) e superior (25º valor) com base no exemplo dado
+    lower_limit_value = sorted_values.iloc[20]  # 7º valor
+    upper_limit_value = sorted_values.iloc[63]  # 25º valor
+    
+    # Calcular a diferença e aplicar a constante de 1.5 para o limite superior
+    difference = upper_limit_value - lower_limit_value
+    upper_limit_final = upper_limit_value + (difference * 1.5)
+
+    # Ajustar valores no ICCP_TOTAL ao limite superior calculado
+    data['ICCP_TOTAL_ADJUSTED'] = data['ICCP_TOTAL'].apply(lambda x: min(x, upper_limit_final))
+
+    # Recalcular métricas usando o ICCP_TOTAL ajustado
+    data_84_days_complete['ICCP_TOTAL_ADJUSTED'] = data['ICCP_TOTAL_ADJUSTED']
+
+    # Filtros da Sidebar
+    st.sidebar.header("Filtros")
+    companhias = data['UNID_AREA_NIVEL_6'].unique()
+    companhia_selecionada = st.sidebar.selectbox("Selecionar Companhia", options=["Todas"] + list(companhias))
+
+    # Filtrar por companhia selecionada se necessário
+    if companhia_selecionada != "Todas":
+        data_filtrada = data_84_days_complete[data_84_days_complete['UNID_AREA_NIVEL_6'] == companhia_selecionada]
+    else:
+        data_filtrada = data_84_days_complete
+
+    # Somar ICCP_TOTAL ajustado por data
+    daily_counts = data_filtrada.groupby('DATA_FATO')['ICCP_TOTAL_ADJUSTED'].sum().reindex(
+        pd.date_range(start=start_date, end=end_date), fill_value=0
+    ).reset_index()
+    daily_counts.columns = ['data', 'ocorrencias']
+
+    # Opções de projeção da sidebar
+    st.sidebar.subheader("Projeção de Novas Datas")
+    dias_a_projetar = st.sidebar.slider("Dias a Projetar", 0, 28, 0)
+    valor_projecao = int(st.sidebar.number_input("Valor Diário Projetado", value=int(daily_counts['ocorrencias'].mean())))
+
+    # Ajustar dias reais exibidos no gráfico com projeções
+    if dias_a_projetar > 0:
+        daily_counts_reduced = daily_counts.iloc[:-dias_a_projetar]
+        projecoes = pd.DataFrame({
+            'data': pd.date_range(start=end_date + timedelta(days=1), periods=dias_a_projetar),
+            'ocorrencias': [valor_projecao] * dias_a_projetar
+        })
+        daily_counts_with_projection = pd.concat([daily_counts_reduced, projecoes], ignore_index=True)
+    else:
+        daily_counts_with_projection = daily_counts
+
+    # Calcular métricas com projeções se disponíveis
+    total_ocorrencias_84_dias = daily_counts_with_projection['ocorrencias'].sum()
+    media_longo_prazo = daily_counts_with_projection['ocorrencias'].mean()
+    media_curto_prazo = daily_counts_with_projection['ocorrencias'][-28:].mean()
+    comparacao_percentual = ((media_curto_prazo - media_longo_prazo) / media_longo_prazo) * 100
+
+    # Determinar a cor da linha de média de 28 dias
+    if comparacao_percentual < -3:
+        cor_media_28_dias = "green"
+    elif -3 <= comparacao_percentual <= 3:
+        cor_media_28_dias = "yellow"
+    else:
+        cor_media_28_dias = "red"
+
+    # Exibir métricas
+    st.title("Dashboard de Ocorrências")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total de Ocorrências (84 dias)", total_ocorrencias_84_dias)
+    col2.metric("Média de Longo Prazo (84 dias)", f"{media_longo_prazo:.2f}")
+    col3.metric("Média de Curto Prazo (28 dias)", f"{media_curto_prazo:.2f}")
+    col4.metric("Comparação Percentual", f"{comparacao_percentual:.2f}%")
+
+    # Gráfico de barras para ocorrências diárias e projeções
+    base_chart = alt.Chart(daily_counts_with_projection).encode(
+        x=alt.X('data:T', title="Data", axis=alt.Axis(format="%d/%m", labelAngle=-45, tickCount=42, grid=True)),
+        y=alt.Y('ocorrencias:Q', title="Contagem de Ocorrências"),
+        tooltip=['data', 'ocorrencias']
+    )
+
+    bar_chart = base_chart.mark_bar()
+    
+    # Linha para o limite superior calculado
+    upper_limit_line = alt.Chart(pd.DataFrame({
+        'data': daily_counts_with_projection['data'],
+        'upper_limit': [upper_limit_final] * len(daily_counts_with_projection['data'])
+    })).mark_line(strokeDash=[3, 3], color="lightblue").encode(
+        x='data:T',
+        y='upper_limit:Q',
+        tooltip=alt.Tooltip('upper_limit', format=".2f", title="Limite Superior")
+    )
+
+    # Combine todos os gráficos
+    st.altair_chart(upper_limit_line + bar_chart, use_container_width=True)
+
 else:
-    data_filtrada = data_84_days
-
-# Contagem diária de ocorrências
-daily_counts = data_filtrada.groupby('data_fato').size().reindex(
-    pd.date_range(start=start_date, end=end_date), fill_value=0
-).reset_index()
-daily_counts.columns = ['data', 'ocorrencias']
-
-# Projeção de novas datas
-st.sidebar.subheader("Projeção de Novas Datas")
-dias_a_projetar = st.sidebar.slider("Dias a Projetar", 0, 28, 0)  # Inclui a opção de 0 dias para projeção
-valor_projecao = int(st.sidebar.number_input("Valor Diário Projetado", value=int(daily_counts['ocorrencias'].mean())))
-
-# Ajustar o número de dias reais mostrados no gráfico ao adicionar projeções
-if dias_a_projetar > 0:
-    # Remover os últimos `dias_a_projetar` dias reais para incluir projeções mantendo o total de 84 dias
-    daily_counts_reduced = daily_counts.iloc[:-dias_a_projetar]
-
-    # Criar DataFrame de projeções
-    projecoes = pd.DataFrame({
-        'data': pd.date_range(start=end_date + timedelta(days=1), periods=dias_a_projetar),
-        'ocorrencias': [valor_projecao] * dias_a_projetar
-    })
-
-    # Concatenar os dados reduzidos com os dados de projeção
-    daily_counts_with_projection = pd.concat([daily_counts_reduced, projecoes], ignore_index=True)
-else:
-    # Se `dias_a_projetar` for 0, usamos os dados reais sem projeção
-    daily_counts_with_projection = daily_counts
-
-# Recalcular métricas considerando os dias projetados, se houver
-total_ocorrencias_84_dias = daily_counts_with_projection['ocorrencias'].sum()
-media_longo_prazo = daily_counts_with_projection['ocorrencias'].mean()
-media_curto_prazo = daily_counts_with_projection['ocorrencias'][-28:].mean()
-comparacao_percentual = ((media_curto_prazo - media_longo_prazo) / media_longo_prazo) * 100
-
-# Determinar a cor da linha de média de 28
-if comparacao_percentual < -3:
-    cor_media_28_dias = "green"
-elif -3 <= comparacao_percentual <= 3:
-    cor_media_28_dias = "yellow"
-else:
-    cor_media_28_dias = "red"
-
-# Exibir cartõesmétricas
-st.title("Dashboard de Ocorrências")
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total de Ocorrências (84 dias)", total_ocorrencias_84_dias)
-col2.metric("Média de Longo Prazo (84 dias)", f"{media_longo_prazo:.2f}")
-col3.metric("Média de Curto Prazo (28 dias)", f"{media_curto_prazo:.2f}")
-col4.metric("Comparação Percentual", f"{comparacao_percentual:.2f}%")
-
-# Configuração do eixo x para garantir a visualização completa dos 84 dias e rótulos das datas
-base_chart = alt.Chart(daily_counts_with_projection).encode(
-    x=alt.X('data:T', title="Data", axis=alt.Axis(format="%d/%m", labelAngle=-45, tickCount=42, grid=True)),
-    y=alt.Y('ocorrencias:Q', title="Contagem de Ocorrências"),
-    tooltip=['data', 'ocorrencias']
-)
-
-# Gráfico de barras para as ocorrências diárias e projeções
-bar_chart = base_chart.mark_bar().encode(
-    y=alt.Y('ocorrencias:Q', title="Contagem de Ocorrências")
-)
-
-# Adicionar linha pontilhada para média de longo prazo (84 dias) com extensão dinâmica
-line_chart = alt.Chart(pd.DataFrame({
-    'data': daily_counts_with_projection['data'],
-    'media_longo_prazo': [media_longo_prazo] * 84  # Estende a média de 84 dias para cobrir todo o gráfico
-})).mark_line(strokeDash=[5, 5], color="black").encode(
-    x='data:T',
-    y='media_longo_prazo:Q',
-    tooltip=alt.Tooltip('media_longo_prazo', format=".2f", title="Média 84 dias")
-)
-
-# Adicionar linha contínua para média de curto prazo (28 dias) com cor dinâmica
-short_term_chart = alt.Chart(pd.DataFrame({
-    'data': pd.date_range(end=end_date + timedelta(days=dias_a_projetar), periods=28),
-    'media_curto_prazo': [media_curto_prazo] * 28
-})).mark_line(color=cor_media_28_dias).encode(
-    x='data:T',
-    y='media_curto_prazo:Q',
-    tooltip=alt.Tooltip('media_curto_prazo', format=".2f", title="Média 28 dias")
-)
-
-# Combinar o gráfico ajustado com a linha de médias 
-
-st.altair_chart(bar_chart + line_chart + short_term_chart, use_container_width=True)
+    st.warning("Por favor, faça o upload de um arquivo CSV para continuar.")
